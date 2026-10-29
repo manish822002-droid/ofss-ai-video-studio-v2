@@ -1,3 +1,5 @@
+
+import asyncio
 import re
 import shutil
 import subprocess
@@ -13,16 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.background import BackgroundTask
 
-
 app = FastAPI(
     title="OFSS AI Video Studio",
-    version="3.0.0",
-    description="Create MP4 videos from images with optional AI narration."
+    version="3.1.0",
+    description="Create MP4 videos from images with smooth camera movement and optional AI narration."
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -30,26 +32,81 @@ app.add_middleware(
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 VOICES = {
-    "en-US-AriaNeural": "English - Aria (Female)",
-    "en-US-GuyNeural": "English - Guy (Male)",
-    "en-US-JennyNeural": "English - Jenny (Female)",
-    "en-US-ChristopherNeural": "English - Christopher (Male)",
-    "en-GB-SoniaNeural": "British English - Sonia",
-    "en-GB-RyanNeural": "British English - Ryan",
-    "hi-IN-SwaraNeural": "Hindi - Swara (Female)",
-    "hi-IN-MadhurNeural": "Hindi - Madhur (Male)",
+    "en-US-AriaNeural": "English US - Aria Female",
+    "en-US-GuyNeural": "English US - Guy Male",
+    "en-US-JennyNeural": "English US - Jenny Female",
+    "en-US-ChristopherNeural": "English US - Christopher Male",
+    "en-GB-SoniaNeural": "English UK - Sonia Female",
+    "en-GB-RyanNeural": "English UK - Ryan Male",
+    "hi-IN-SwaraNeural": "Hindi - Swara Female",
+    "hi-IN-MadhurNeural": "Hindi - Madhur Male",
 }
 
 MAX_IMAGES = 40
 MAX_IMAGE_SIZE = 12 * 1024 * 1024
 MAX_SCRIPT_LENGTH = 12000
+ALLOWED_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+
+def run_ffmpeg(args, timeout=600):
+    command = [
+        FFMPEG,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+    ] + args
+
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            504,
+            "Video rendering timed out. Try fewer images."
+        )
+
+    if result.returncode != 0:
+        message = (result.stderr or "FFmpeg failed")[-3000:]
+        raise HTTPException(
+            500,
+            f"Video rendering failed: {message}"
+        )
+
+    return result
+
+
+async def make_tts(script, voice, output_path):
+    try:
+        communicate = edge_tts.Communicate(
+            script,
+            voice
+        )
+        await communicate.save(str(output_path))
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"Voice generation failed: {str(exc)[:500]}"
+        )
+
+
+def cleanup_folder(folder):
+    shutil.rmtree(folder, ignore_errors=True)
 
 
 @app.get("/")
-def home():
+async def home():
     return {
         "service": "OFSS AI Video Studio",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "ok",
         "upload_page": "/upload",
         "docs": "/docs",
@@ -58,422 +115,268 @@ def home():
 
 
 @app.get("/api/health")
-def health():
+async def health():
     return {
         "status": "ok",
-        "ffmpeg": "available",
-        "version": "3.0.0",
+        "ffmpeg_available": Path(FFMPEG).exists(),
+        "version": "3.1.0",
     }
 
 
 @app.get("/upload", response_class=HTMLResponse)
-def upload_page():
-    voice_options = "".join(
-        f'<option value="{escape(name)}">{escape(label)}</option>'
-        for name, label in VOICES.items()
+async def upload_page():
+    options = "".join(
+        f'<option value="{escape(key)}">{escape(label)}</option>'
+        for key, label in VOICES.items()
     )
 
-    html = """
-<!DOCTYPE html>
+    return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OFSS AI Video Studio</title>
 <style>
-* { box-sizing: border-box; }
-body {
-    margin: 0;
-    padding: 20px;
-    font-family: Arial, sans-serif;
-    background: #f1f5fb;
-    color: #172033;
-}
-main { max-width: 720px; margin: 20px auto; }
-header {
-    padding: 25px;
-    background: #142a52;
-    color: white;
-    border-radius: 14px 14px 0 0;
-}
-header h1 { margin: 0 0 10px; }
-header p { line-height: 1.6; margin-bottom: 0; }
-form {
-    padding: 24px;
-    background: white;
-    border-radius: 0 0 14px 14px;
-    box-shadow: 0 8px 28px #152b4d15;
-}
-label {
-    display: block;
-    margin: 19px 0 8px;
-    font-weight: bold;
-}
-input, select, textarea, button {
-    width: 100%;
-    padding: 13px;
-    font-size: 16px;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
-}
-input[type=file] { background: #f8faff; }
-textarea { resize: vertical; line-height: 1.5; }
-small {
-    display: block;
-    margin-top: 6px;
-    color: #5b6678;
-    line-height: 1.5;
-}
-button {
-    margin-top: 24px;
-    background: #155eef;
-    color: white;
-    border: 0;
-    font-weight: bold;
-    cursor: pointer;
-}
-button:disabled { opacity: .6; cursor: wait; }
-#status {
-    display: none;
-    margin-top: 18px;
-    padding: 14px;
-    border-radius: 8px;
-    line-height: 1.6;
-    overflow-wrap: anywhere;
-}
-.note {
-    margin-top: 18px;
-    padding: 13px;
-    border-radius: 8px;
-    background: #edf4ff;
-    font-size: 14px;
-    line-height: 1.6;
-}
+*{{box-sizing:border-box}}
+body{{font-family:Arial,sans-serif;background:#f1f5f9;color:#172033;margin:0;padding:18px}}
+main{{max-width:720px;margin:20px auto;background:white;padding:24px;border-radius:15px;box-shadow:0 5px 25px #0001}}
+h1{{margin-top:0}}
+p{{color:#526176;line-height:1.5}}
+label{{display:block;font-weight:bold;margin:18px 0 7px}}
+input,select,textarea{{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:8px;font-size:16px}}
+textarea{{min-height:120px;resize:vertical}}
+button{{width:100%;padding:14px;margin-top:22px;background:#155eef;color:white;border:0;border-radius:9px;font-size:17px;font-weight:bold;cursor:pointer}}
+button:disabled{{opacity:.6}}
+small{{color:#64748b}}
+#status{{white-space:pre-wrap;margin-top:18px;line-height:1.5}}
 </style>
 </head>
 <body>
 <main>
-<header>
 <h1>OFSS AI Video Studio</h1>
-<p>Create MP4 videos from your images with optional Hindi or English
-AI narration. Choose YouTube landscape or vertical Reels format.</p>
-</header>
-
+<p>Create MP4 videos with smooth zoom-in, zoom-out and horizontal camera movement.</p>
 <form id="videoForm">
-<label for="images">Upload images *</label>
-<input id="images" name="images" type="file"
-accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
-multiple required>
-<small>Select 1–40 JPG, PNG, or WebP images. Maximum 12 MB per image.</small>
+<label>Choose photos (1–40)</label>
+<input type="file" name="images" accept="image/jpeg,image/png,image/webp" multiple required>
+<small>JPG, PNG or WebP. Maximum 12 MB per photo.</small>
 
-<label for="script">Voice-over script (optional)</label>
-<textarea id="script" name="script" rows="7" maxlength="12000"
-placeholder="Paste your Hindi or English narration here..."></textarea>
-<small>Maximum 12,000 characters. Leave empty for a video without narration.</small>
+<label>Voice-over script (optional)</label>
+<textarea name="script" maxlength="12000" placeholder="Paste your Hindi or English narration here. Leave empty for no narration."></textarea>
 
-<label for="voice">AI voice</label>
-<select id="voice" name="voice">VOICE_OPTIONS</select>
+<label>Voice</label>
+<select name="voice">{options}</select>
 
-<label for="aspect_ratio">Video format</label>
-<select id="aspect_ratio" name="aspect_ratio">
-<option value="16:9">Landscape 16:9 — YouTube</option>
-<option value="9:16">Portrait 9:16 — Shorts / Reels</option>
+<label>Video orientation</label>
+<select name="aspect_ratio">
+<option value="16:9">Landscape 16:9 - YouTube</option>
+<option value="9:16">Portrait 9:16 - Shorts/Reels</option>
 </select>
 
-<label for="seconds_per_image">Seconds per image</label>
-<input id="seconds_per_image" name="seconds_per_image"
-type="number" min="3" max="30" value="8" required>
-<small>Used when no script is provided. With narration, the audio determines duration.</small>
+<label>Duration per photo</label>
+<select name="seconds_per_image">
+<option value="5">5 seconds</option>
+<option value="6">6 seconds</option>
+<option value="8" selected>8 seconds</option>
+<option value="10">10 seconds</option>
+<option value="12">12 seconds</option>
+</select>
 
-<button id="submitButton" type="submit">Create and Download MP4</button>
-<div id="status" role="status" aria-live="polite"></div>
-
-<div class="note">
-Keep this page open while the video is being generated. Free hosting
-may take several minutes to process multiple images.
-</div>
+<button id="submitBtn" type="submit">Create and Download MP4</button>
 </form>
+<div id="status" role="status"></div>
 </main>
 
 <script>
-const form = document.getElementById("videoForm");
-const button = document.getElementById("submitButton");
-const statusBox = document.getElementById("status");
+const form = document.getElementById('videoForm');
+const statusBox = document.getElementById('status');
+const btn = document.getElementById('submitBtn');
 
-form.addEventListener("submit", async function(event) {
+form.addEventListener('submit', async (event) => {{
     event.preventDefault();
 
-    const files = document.getElementById("images").files;
-    const script = document.getElementById("script").value;
+    const files = form.querySelector('input[name="images"]').files;
 
-    if (!files.length || files.length > 40) {
-        alert("Please select between 1 and 40 images.");
+    if (!files.length) {{
+        statusBox.textContent = 'Please select at least one photo.';
         return;
-    }
+    }}
 
-    if (script.length > 12000) {
-        alert("Script must not exceed 12,000 characters.");
+    if (files.length > 40) {{
+        statusBox.textContent = 'Maximum 40 photos allowed.';
         return;
-    }
+    }}
 
-    const data = new FormData(form);
+    btn.disabled = true;
+    statusBox.textContent = 'Creating your video. Please keep this page open; rendering may take several minutes.';
 
-    button.disabled = true;
-    statusBox.style.display = "block";
-    statusBox.style.background = "#edf4ff";
-    statusBox.textContent =
-        "Creating your video. Please wait and keep this page open.";
+    try {{
+        const response = await fetch('/api/video', {{
+            method: 'POST',
+            body: new FormData(form)
+        }});
 
-    try {
-        const response = await fetch("/api/video", {
-            method: "POST",
-            body: data
-        });
-
-        if (!response.ok) {
-            let message = "Video generation failed.";
-            try {
-                const error = await response.json();
-                message = error.detail || message;
-            } catch (_) {}
+        if (!response.ok) {{
+            let message = await response.text();
+            try {{
+                message = JSON.parse(message).detail || message;
+            }} catch (e) {{}}
             throw new Error(message);
-        }
+        }}
 
         const blob = await response.blob();
-
-        if (!blob.size) {
-            throw new Error("The server returned an empty video.");
-        }
-
         const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
+        const link = document.createElement('a');
+
         link.href = url;
-        link.download = "OFSS-AI-Video.mp4";
+        link.download = 'ofss-ai-video.mp4';
         document.body.appendChild(link);
         link.click();
         link.remove();
 
         setTimeout(() => URL.revokeObjectURL(url), 60000);
-
-        statusBox.style.background = "#e8f8ed";
-        statusBox.textContent =
-            "Video created. Your MP4 download should have started.";
-
-    } catch (error) {
-        statusBox.style.background = "#fff0f0";
-        statusBox.textContent = "Error: " + error.message;
-    } finally {
-        button.disabled = false;
-    }
-});
+        statusBox.textContent = 'Video created. Your MP4 download should begin.';
+    }} catch (error) {{
+        statusBox.textContent = 'Video creation failed: ' + error.message;
+    }} finally {{
+        btn.disabled = false;
+    }}
+}});
 </script>
 </body>
-</html>
-"""
-    html = html.replace("VOICE_OPTIONS", voice_options)
-    return HTMLResponse(content=html)
-
-
-def run_ffmpeg(args, timeout=900):
-    result = subprocess.run(
-        [FFMPEG, "-hide_banner", "-y", *args],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-
-    if result.returncode != 0:
-        message = (result.stderr or "FFmpeg failed")[-2500:]
-        raise RuntimeError(message)
-
-    return result
-
-
-def audio_duration(path):
-    result = subprocess.run(
-        [
-            FFMPEG,
-            "-hide_banner",
-            "-i", str(path),
-            "-f", "null",
-            "-"
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-    output = (result.stderr or "") + (result.stdout or "")
-    match = re.search(
-        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
-        output,
-    )
-
-    if not match:
-        raise RuntimeError("Could not determine audio duration.")
-
-    hours, minutes, seconds = match.groups()
-    duration = (
-        int(hours) * 3600
-        + int(minutes) * 60
-        + float(seconds)
-    )
-
-    if duration <= 0:
-        raise RuntimeError("Generated audio duration is zero.")
-
-    return duration
-
-
-def cleanup_directory(path):
-    shutil.rmtree(str(path), ignore_errors=True)
+</html>""")
 
 
 @app.post("/api/video")
 async def create_video(
-    images: list[UploadFile] = File(
-        ...,
-        description="Upload one or more JPG, PNG, or WebP image files",
-    ),
+    images: list[UploadFile] = File(...),
     script: str = Form(""),
     voice: str = Form("en-US-AriaNeural"),
     aspect_ratio: str = Form("16:9"),
     seconds_per_image: int = Form(8),
 ):
     if not images or len(images) > MAX_IMAGES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Upload between 1 and {MAX_IMAGES} images.",
-        )
+        raise HTTPException(400, "Upload between 1 and 40 images.")
 
     if voice not in VOICES:
-        raise HTTPException(status_code=400, detail="Unsupported voice.")
+        raise HTTPException(400, "Unsupported voice.")
 
-    if aspect_ratio not in ("16:9", "9:16"):
-        raise HTTPException(
-            status_code=400,
-            detail="Choose 16:9 or 9:16.",
-        )
+    if aspect_ratio not in {"16:9", "9:16"}:
+        raise HTTPException(400, "Invalid video orientation.")
 
-    if not 3 <= seconds_per_image <= 30:
-        raise HTTPException(
-            status_code=400,
-            detail="Seconds per image must be between 3 and 30.",
-        )
+    if seconds_per_image not in {5, 6, 8, 10, 12}:
+        raise HTTPException(400, "Invalid photo duration.")
+
+    script = (script or "").strip()
 
     if len(script) > MAX_SCRIPT_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail="Script must not exceed 12,000 characters.",
-        )
+        raise HTTPException(400, "Script exceeds 12000 characters.")
 
     workdir = Path(tempfile.mkdtemp(prefix="ofss_video_"))
-    output_path = workdir / "OFSS-AI-Video.mp4"
 
     try:
-        valid_images = []
+        saved_images = []
 
         for index, upload in enumerate(images):
-            try:
-                content_type = (upload.content_type or "").lower()
+            content_type = (upload.content_type or "").lower()
 
-                if content_type not in {
-                    "image/jpeg",
-                    "image/png",
-                    "image/webp",
-                }:
-                    continue
+            if content_type not in ALLOWED_TYPES:
+                raise HTTPException(
+                    400,
+                    f"Photo {index + 1}: upload JPG, PNG or WebP."
+                )
 
-                data = await upload.read(MAX_IMAGE_SIZE + 1)
+            data = await upload.read(MAX_IMAGE_SIZE + 1)
 
-                if not data or len(data) > MAX_IMAGE_SIZE:
-                    continue
+            if not data:
+                raise HTTPException(
+                    400,
+                    f"Photo {index + 1} is empty."
+                )
 
-                suffix = {
-                    "image/jpeg": ".jpg",
-                    "image/png": ".png",
-                    "image/webp": ".webp",
-                }[content_type]
+            if len(data) > MAX_IMAGE_SIZE:
+                raise HTTPException(
+                    400,
+                    f"Photo {index + 1} exceeds 12 MB."
+                )
 
-                image_path = workdir / f"image_{index:03d}{suffix}"
-                image_path.write_bytes(data)
-                valid_images.append(image_path)
+            suffix = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+            }[content_type]
 
-            finally:
-                await upload.close()
+            image_path = workdir / f"image_{index:03d}{suffix}"
+            image_path.write_bytes(data)
+            saved_images.append(image_path)
+            await upload.close()
 
-        if not valid_images:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid images. Use JPG, PNG, or WebP files under 12 MB each.",
-            )
-
-        width, height = (
-            (1280, 720)
-            if aspect_ratio == "16:9"
-            else (720, 1280)
-        )
-
-        fps = 24
-        narration = script.strip()
-        voice_path = workdir / "voice.mp3"
-
-        if narration:
-            try:
-                await edge_tts.Communicate(
-                    narration,
-                    voice,
-                    rate="+0%",
-                ).save(str(voice_path))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"AI voice generation failed: {str(exc)[:400]}"
-                ) from exc
-
-            duration = audio_duration(voice_path)
+        if aspect_ratio == "16:9":
+            width, height = 1280, 720
         else:
-            duration = len(valid_images) * seconds_per_image
+            width, height = 720, 1280
 
-        per_image = duration / len(valid_images)
+        fps = 25
+        frame_count = seconds_per_image * fps
         segments = []
 
-        for index, image_path in enumerate(valid_images):
+        for index, image_path in enumerate(saved_images):
             segment_path = workdir / f"segment_{index:03d}.mp4"
 
-            video_filter = (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},"
-                "zoompan=z='min(zoom+0.0005,1.08)':"
+            # Alternate between zooming in and out, and
+            # reverse the horizontal pan on every other photo.
+            zoom_in = index % 2 == 0
+            pan_forward = (index // 2) % 2 == 0
+
+            if zoom_in:
+                zoom_expr = "min(zoom+0.0009,1.14)"
+            else:
+                zoom_expr = "if(eq(on,0),1.14,max(zoom-0.0009,1.0))"
+
+            if pan_forward:
+                x_expr = (
+                    f"(iw-iw/zoom)*on/{frame_count - 1}"
+                )
+            else:
+                x_expr = (
+                    f"(iw-iw/zoom)*(1-on/{frame_count - 1})"
+                )
+
+            y_expr = "ih/2-ih/zoom/2"
+
+            filters = (
+                f"scale={width * 2}:{height * 2}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width * 2}:{height * 2},"
+                f"zoompan=z='{zoom_expr}':"
+                f"x='{x_expr}':y='{y_expr}':"
                 f"d=1:s={width}x{height}:fps={fps},"
-                "format=yuv420p"
+                f"trim=duration={seconds_per_image},"
+                "setpts=PTS-STARTPTS,setsar=1,format=yuv420p"
             )
 
             run_ffmpeg([
                 "-loop", "1",
                 "-framerate", str(fps),
                 "-i", str(image_path),
-                "-vf", video_filter,
+                "-vf", filters,
+                "-frames:v", str(frame_count),
                 "-an",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
+                "-crf", "23",
                 "-pix_fmt", "yuv420p",
-                "-r", str(fps),
-                "-t", f"{per_image:.3f}",
+                "-movflags", "+faststart",
                 str(segment_path),
             ])
 
-            if not segment_path.exists() or segment_path.stat().st_size == 0:
-                raise RuntimeError(
-                    f"Could not create video segment {index + 1}."
-                )
-
             segments.append(segment_path)
 
-        concat_path = workdir / "segments.txt"
-        concat_path.write_text(
+        concat_file = workdir / "concat.txt"
+
+        concat_file.write_text(
             "".join(
-                f"file '{segment.as_posix()}'\n"
-                for segment in segments
+                f"file '{path.as_posix()}'\n"
+                for path in segments
             ),
             encoding="utf-8",
         )
@@ -483,52 +386,50 @@ async def create_video(
         run_ffmpeg([
             "-f", "concat",
             "-safe", "0",
-            "-i", str(concat_path),
+            "-i", str(concat_file),
             "-c", "copy",
+            "-an",
             "-movflags", "+faststart",
             str(silent_video),
         ])
 
-        if narration:
+        final_path = workdir / "ofss-ai-video.mp4"
+
+        if script:
+            audio_path = workdir / "narration.mp3"
+            await make_tts(script, voice, audio_path)
+
+            total_duration = len(saved_images) * seconds_per_image
+
             run_ffmpeg([
                 "-i", str(silent_video),
-                "-i", str(voice_path),
+                "-i", str(audio_path),
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "128k",
-                "-shortest",
+                "-t", str(total_duration),
                 "-movflags", "+faststart",
-                str(output_path),
+                str(final_path),
             ])
         else:
-            shutil.copy2(silent_video, output_path)
-
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError("The MP4 output was not created.")
+            shutil.copy2(silent_video, final_path)
 
         return FileResponse(
-            path=str(output_path),
+            str(final_path),
             media_type="video/mp4",
-            filename="OFSS-AI-Video.mp4",
-            background=BackgroundTask(cleanup_directory, workdir),
+            filename="ofss-ai-video.mp4",
+            background=BackgroundTask(cleanup_folder, workdir),
         )
 
     except HTTPException:
-        cleanup_directory(workdir)
+        cleanup_folder(workdir)
         raise
 
-    except subprocess.TimeoutExpired:
-        cleanup_directory(workdir)
-        raise HTTPException(
-            status_code=504,
-            detail="Video creation timed out. Try fewer images or a shorter script.",
-        )
-
     except Exception as exc:
-        cleanup_directory(workdir)
+        cleanup_folder(workdir)
         raise HTTPException(
-            status_code=500,
-            detail=f"Video generation failed: {str(exc)[:1000]}",
+            500,
+            f"Video generation failed: {str(exc)[:1200]}"
         )
