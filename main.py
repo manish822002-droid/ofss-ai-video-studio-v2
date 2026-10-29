@@ -77,7 +77,10 @@ def get_audio_duration(audio_path):
 
 @app.post("/api/video")
 async def create_video(
-    images: list[UploadFile] = File(...),
+    images: list[UploadFile] = File(
+    ...,
+    description="Upload one or more JPG, PNG, or WebP image files"
+),
     script: str = Form(""),
     voice: str = Form("en-US-AriaNeural"),
     aspect_ratio: str = Form("16:9"),
